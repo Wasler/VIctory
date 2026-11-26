@@ -23,20 +23,71 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 const SLOTS: u32 = 16;
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=3, b0), DescriptorTable(SRV(t0, numDescriptors=2), UAV(u0)), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
-cbuffer Size : register(b0) { uint w; uint h; uint premultiplied; };
+#define RS "RootConstants(num32BitConstants=5, b0), DescriptorTable(SRV(t0, numDescriptors=2), UAV(u0)), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
+cbuffer Size : register(b0) {
+    uint w;
+    uint h;
+    uint premultiplied;
+    float sharpen;
+    uint ui_downscale;
+};
 Texture2D<float4> game : register(t0);
 Texture2D<float4> ui : register(t1);
 RWTexture2D<float4> outp : register(u0);
 SamplerState linear_clamp : register(s0);
+
+// AMD FidelityFX RCAS (Robust Contrast-Adaptive Sharpening): restores crisp
+// detail from 720p->1080p upscaling without white halos or ringing on edges.
+float3 rcas(int2 p, int2 dim, float strength) {
+    float3 cc = game.Load(int3(p, 0)).rgb;
+    if (strength <= 0.001) return cc;
+
+    float3 cn = game.Load(int3(p.x, max(p.y - 1, 0), 0)).rgb;
+    float3 cs = game.Load(int3(p.x, min(p.y + 1, dim.y - 1), 0)).rgb;
+    float3 cw = game.Load(int3(max(p.x - 1, 0), p.y, 0)).rgb;
+    float3 ce = game.Load(int3(min(p.x + 1, dim.x - 1), p.y, 0)).rgb;
+
+    const float3 luma = float3(0.2126, 0.7152, 0.0722);
+    float lc = dot(cc, luma);
+    float ln = dot(cn, luma);
+    float ls = dot(cs, luma);
+    float lw = dot(cw, luma);
+    float le = dot(ce, luma);
+
+    float mn = min(lc, min(min(ln, ls), min(lw, le)));
+    float mx = max(lc, max(max(ln, ls), max(lw, le)));
+
+    float hitMin = mn / max(4.0 * mx, 1e-5);
+    float hitMax = (1.0 - mx) / max(4.0 * (1.0 - mn), 1e-5);
+    float lobe = max(-hitMin, -hitMax);
+    float peak = -0.1875 * saturate(strength);
+    float weight = clamp(lobe, peak, 0.0);
+
+    float rcpW = rcp(4.0 * weight + 1.0);
+    return saturate((cc + weight * (cn + cs + cw + ce)) * rcpW);
+}
+
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= w || id.y >= h) return;
-    float2 uv = (float2(id.xy) + 0.5) / float2(w, h);
-    float4 g = game.Load(int3(id.xy, 0));
-    float4 u = ui.SampleLevel(linear_clamp, uv, 0);
-    float3 c = premultiplied != 0 ? g.rgb * (1.0 - u.a) + u.rgb : lerp(g.rgb, u.rgb, u.a);
+    float2 invDim = rcp(float2(w, h));
+    float2 uv = (float2(id.xy) + 0.5) * invDim;
+    float3 g = rcas(int2(id.xy), int2(w, h), sharpen);
+    float4 u;
+    if (ui_downscale != 0) {
+        // 4-tap 2x2 box filter for crisp 4K UI -> 1080p downscaling.
+        float2 d = 0.25 * invDim;
+        u = 0.25 * (
+            ui.SampleLevel(linear_clamp, uv + float2(-d.x, -d.y), 0) +
+            ui.SampleLevel(linear_clamp, uv + float2( d.x, -d.y), 0) +
+            ui.SampleLevel(linear_clamp, uv + float2(-d.x,  d.y), 0) +
+            ui.SampleLevel(linear_clamp, uv + float2( d.x,  d.y), 0)
+        );
+    } else {
+        u = ui.SampleLevel(linear_clamp, uv, 0);
+    }
+    float3 c = premultiplied != 0 ? g * (1.0 - u.a) + u.rgb : lerp(g, u.rgb, u.a);
     outp[id.xy] = float4(c, 1.0);
 }
 "#;
@@ -120,6 +171,17 @@ fn rgba8(format: DXGI_FORMAT) -> bool {
 fn premultiplied() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PLANE_PREMULTIPLIED").is_some_and(|v| v == "1"))
+}
+
+/// RCAS sharpening strength in `[0.0, 1.0]` (`VICTORY_COMPOSE_SHARPEN`, default `0.70`; `0` disables).
+fn sharpen() -> f32 {
+    static VAL: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("VICTORY_COMPOSE_SHARPEN")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .map_or(0.70, |v| v.clamp(0.0, 1.0))
+    })
 }
 
 /// Records, into the present's `list`, `ui` laid over `game` into a
@@ -223,7 +285,8 @@ pub(crate) fn record(
         before.push(t(ui, ui_state, read));
         after.push(t(ui, read, ui_state));
     }
-    let constants: [u32; 3] = [w as u32, h, u32::from(premultiplied())];
+    let ui_downscale = u32::from(ud.Width > w || ud.Height > h);
+    let constants: [u32; 5] = [w as u32, h, u32::from(premultiplied()), sharpen().to_bits(), ui_downscale];
     // SAFETY: an open list (the present's); slots of our heap; live
     // resources and objects (the pass's own live as long as the process,
     // the texture is kept by the present's list).
@@ -235,10 +298,47 @@ pub(crate) fn record(
         list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
         list.SetComputeRootSignature(&pass.root);
         list.SetPipelineState(&pass.pso);
-        list.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+        list.SetComputeRoot32BitConstants(0, 5, constants.as_ptr().cast(), 0);
         list.SetComputeRootDescriptorTable(1, gpu);
         list.Dispatch((w as u32).div_ceil(8), h.div_ceil(8), 1);
         list.ResourceBarrier(&after);
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compose_rcas_shader_compiles_cleanly() {
+        let mut code: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        let hr = unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                windows::core::s!("present planes"),
+                None,
+                None,
+                windows::core::s!("main"),
+                windows::core::s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+        };
+        if let Err(e) = hr {
+            let msg = errors
+                .as_ref()
+                .map(|b| unsafe {
+                    let s = std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize());
+                    String::from_utf8_lossy(s).into_owned()
+                })
+                .unwrap_or_default();
+            panic!("compose HLSL failed to compile ({e}): {msg}");
+        }
+        assert!(code.is_some());
+    }
 }
