@@ -43,6 +43,8 @@ mod heap_worker;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+pub use host::mouse_capture;
+#[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;

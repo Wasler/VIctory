@@ -9616,12 +9616,138 @@ fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     Ok(HWND(hwnd as *mut _))
 }
 
+/// Mouse capture state for camera look (click window to capture, Caps Lock to release).
+pub mod mouse_capture {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use windows::Win32::Foundation::{HWND, POINT, RECT};
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        ClipCursor, GetClientRect, IDC_ARROW, LoadCursorW, SetCursor, SetCursorPos,
+    };
+
+    static CAPTURED: AtomicBool = AtomicBool::new(false);
+    static FIRST_CLICK_SUPPRESS: AtomicBool = AtomicBool::new(false);
+    static WINDOW: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn register_window(hwnd: HWND) {
+        WINDOW.store(hwnd.0 as usize, Ordering::Release);
+    }
+
+    pub fn is_captured() -> bool {
+        CAPTURED.load(Ordering::Acquire)
+    }
+
+    pub fn take_first_click_suppress() -> bool {
+        FIRST_CLICK_SUPPRESS.swap(false, Ordering::AcqRel)
+    }
+
+    pub fn window_center() -> Option<(i32, i32)> {
+        let raw = WINDOW.load(Ordering::Acquire);
+        if raw == 0 {
+            return None;
+        }
+        let hwnd = HWND(raw as *mut _);
+        let mut rect = RECT::default();
+        // SAFETY: valid window handle and output rect.
+        if unsafe { GetClientRect(hwnd, &mut rect) }.is_err() {
+            return None;
+        }
+        let mut pt = POINT {
+            x: (rect.left + rect.right) / 2,
+            y: (rect.top + rect.bottom) / 2,
+        };
+        // SAFETY: valid window handle and point.
+        if !unsafe { ClientToScreen(hwnd, &mut pt) }.as_bool() {
+            return None;
+        }
+        Some((pt.x, pt.y))
+    }
+
+    pub(super) fn clip_to_window() {
+        let raw = WINDOW.load(Ordering::Acquire);
+        if raw == 0 {
+            return;
+        }
+        let hwnd = HWND(raw as *mut _);
+        let mut rect = RECT::default();
+        // SAFETY: valid window handle and rect.
+        if unsafe { GetClientRect(hwnd, &mut rect) }.is_err() {
+            return;
+        }
+        let mut tl = POINT { x: rect.left, y: rect.top };
+        let mut br = POINT { x: rect.right, y: rect.bottom };
+        // SAFETY: converting client corners to screen coordinates and clipping cursor.
+        unsafe {
+            if ClientToScreen(hwnd, &mut tl).as_bool() && ClientToScreen(hwnd, &mut br).as_bool() {
+                let screen = RECT { left: tl.x, top: tl.y, right: br.x, bottom: br.y };
+                let _ = ClipCursor(Some(&screen));
+            }
+        }
+    }
+
+    pub fn set_captured(on: bool) {
+        let was = CAPTURED.swap(on, Ordering::AcqRel);
+        if on {
+            if !was {
+                FIRST_CLICK_SUPPRESS.store(true, Ordering::Release);
+            }
+            clip_to_window();
+            if let Some((cx, cy)) = window_center() {
+                // SAFETY: recentering cursor inside our own window.
+                let _ = unsafe { SetCursorPos(cx, cy) };
+            }
+            // SAFETY: hiding cursor on the calling thread if it owns the window.
+            unsafe { SetCursor(None) };
+        } else {
+            FIRST_CLICK_SUPPRESS.store(false, Ordering::Release);
+            // SAFETY: releasing cursor clip and restoring arrow cursor.
+            unsafe {
+                let _ = ClipCursor(None);
+                if let Ok(arrow) = LoadCursorW(None, IDC_ARROW) {
+                    SetCursor(Some(arrow));
+                }
+            }
+        }
+    }
+}
+
 extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    match message {
+        WM_LBUTTONDOWN => {
+            if !mouse_capture::is_captured() {
+                mouse_capture::set_captured(true);
+            }
+            return LRESULT(0);
+        }
+        WM_KILLFOCUS => {
+            if mouse_capture::is_captured() {
+                mouse_capture::set_captured(false);
+            }
+        }
+        WM_ACTIVATE => {
+            if (wparam.0 & 0xFFFF) == 0 && mouse_capture::is_captured() {
+                mouse_capture::set_captured(false);
+            }
+        }
+        WM_MOVE | WM_SIZE => {
+            if mouse_capture::is_captured() {
+                mouse_capture::clip_to_window();
+            }
+        }
+        WM_SETCURSOR => {
+            if mouse_capture::is_captured() && (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
+                // SAFETY: hides the cursor while captured inside the client area.
+                unsafe { SetCursor(None) };
+                return LRESULT(1);
+            }
+        }
+        _ => {}
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
@@ -9647,7 +9773,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             bottom: height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
-        CreateWindowExW(
+        let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
             w!("VIctory"),
@@ -9660,7 +9786,9 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             None,
             Some(instance.into()),
             None,
-        )
+        )?;
+        mouse_capture::register_window(hwnd);
+        Ok(hwnd)
     }
 }
 

@@ -63,7 +63,7 @@ const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
+const FALLBACK_BUTTONS: [(u8, u32); 16] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
     (0x0D, A),    // Enter
@@ -77,6 +77,8 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (b'Q', LEFT_SHOULDER),
     (b'E', RIGHT_SHOULDER),
     (b'F', LEFT_STICK),
+    (0xA0, LEFT_STICK), // Left Shift -> L3
+    (0xA1, LEFT_STICK), // Right Shift -> L3
     (b'H', RIGHT_STICK),
 ];
 
@@ -111,6 +113,10 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// Mouse camera / trigger overlay while cursor is captured.
+    fn mouse_pad(&mut self) -> PadState {
+        PadState::default()
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
@@ -430,12 +436,12 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.mouse_pad())
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
+        let events = self.state().poll(&self.devices, self.one_pad, pads, keys, mouse);
         self.deliver(events);
     }
 
@@ -481,11 +487,13 @@ impl State {
         one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: PadState,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        let kb_pad = merged(fallback(&keys), mouse);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads.into_iter().flatten().fold(kb_pad, merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -494,7 +502,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(kb_pad));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1119,6 +1127,7 @@ pub(crate) fn module() -> HleModule {
 mod host {
     use std::time::{Duration, Instant};
 
+    use windows_sys::Win32::Foundation::POINT;
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
@@ -1132,7 +1141,7 @@ mod host {
         XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
+        GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, SetCursorPos,
     };
 
     use super::*;
@@ -1177,6 +1186,21 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        caps_was_down: bool,
+        suppress_lmb: bool,
+        smooth_x: f32,
+        smooth_y: f32,
+    }
+
+    fn mouse_sens() -> f32 {
+        static SENS: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        *SENS.get_or_init(|| {
+            std::env::var("VICTORY_MOUSE_SENS")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0 && *v <= 1.0)
+                .unwrap_or(0.045)
+        })
     }
 
     impl Source for Host {
@@ -1233,6 +1257,85 @@ mod host {
                     ..Default::default()
                 })
                 .collect()
+        }
+
+        fn mouse_pad(&mut self) -> PadState {
+            const VK_LBUTTON: i32 = 0x01;
+            const VK_RBUTTON: i32 = 0x02;
+            const VK_CAPITAL: i32 = 0x14;
+
+            if !focused() {
+                if victory_gpu::mouse_capture::is_captured() {
+                    victory_gpu::mouse_capture::set_captured(false);
+                }
+                self.caps_was_down = false;
+                self.suppress_lmb = false;
+                self.smooth_x = 0.0;
+                self.smooth_y = 0.0;
+                return PadState::default();
+            }
+
+            // SAFETY: plain key-state query.
+            let caps_down = unsafe { GetAsyncKeyState(VK_CAPITAL) } < 0;
+            if caps_down && !self.caps_was_down && victory_gpu::mouse_capture::is_captured() {
+                victory_gpu::mouse_capture::set_captured(false);
+                self.suppress_lmb = false;
+                self.smooth_x = 0.0;
+                self.smooth_y = 0.0;
+            }
+            self.caps_was_down = caps_down;
+
+            if !victory_gpu::mouse_capture::is_captured() {
+                self.suppress_lmb = false;
+                self.smooth_x = 0.0;
+                self.smooth_y = 0.0;
+                return PadState::default();
+            }
+
+            let mut target_x = 0.0f32;
+            let mut target_y = 0.0f32;
+            if let Some((cx, cy)) = victory_gpu::mouse_capture::window_center() {
+                let mut pt = POINT { x: cx, y: cy };
+                // SAFETY: reading and recentering cursor inside our own captured window.
+                if unsafe { GetCursorPos(&mut pt) } != 0 {
+                    let dx = pt.x - cx;
+                    let dy = pt.y - cy;
+                    if dx != 0 || dy != 0 {
+                        unsafe { SetCursorPos(cx, cy) };
+                        let sens = mouse_sens();
+                        target_x = (dx as f32 * sens).clamp(-1.0, 1.0);
+                        target_y = (-(dy as f32) * sens).clamp(-1.0, 1.0);
+                    }
+                }
+            }
+
+            self.smooth_x = self.smooth_x * 0.35 + target_x * 0.65;
+            self.smooth_y = self.smooth_y * 0.35 + target_y * 0.65;
+            if self.smooth_x.abs() < 0.01 {
+                self.smooth_x = 0.0;
+            }
+            if self.smooth_y.abs() < 0.01 {
+                self.smooth_y = 0.0;
+            }
+
+            if victory_gpu::mouse_capture::take_first_click_suppress() {
+                self.suppress_lmb = true;
+            }
+            // SAFETY: plain mouse-button queries.
+            let lmb_down = unsafe { GetAsyncKeyState(VK_LBUTTON) } < 0;
+            let rmb_down = unsafe { GetAsyncKeyState(VK_RBUTTON) } < 0;
+            if !lmb_down {
+                self.suppress_lmb = false;
+            }
+
+            PadState {
+                // Xbox GTA controls: RMB = LT (Aim / Brake), LMB = RT (Shoot / Gas).
+                left_trigger: if rmb_down { 1.0 } else { 0.0 },
+                right_trigger: if lmb_down && !self.suppress_lmb { 1.0 } else { 0.0 },
+                right_x: self.smooth_x,
+                right_y: self.smooth_y,
+                ..Default::default()
+            }
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
