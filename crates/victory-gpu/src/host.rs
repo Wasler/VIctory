@@ -9131,6 +9131,7 @@ impl Host {
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            mouse_capture::attach_window(hwnd);
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
@@ -9619,18 +9620,94 @@ fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
 /// Mouse capture state for camera look (click window to capture, Caps Lock to release).
 pub mod mouse_capture {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use windows::Win32::Foundation::{HWND, POINT, RECT};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::ClientToScreen;
     use windows::Win32::UI::WindowsAndMessaging::{
-        ClipCursor, GetClientRect, IDC_ARROW, LoadCursorW, SetCursor, SetCursorPos,
+        CallWindowProcW, ClipCursor, DefWindowProcW, GWLP_WNDPROC, GetClientRect, HTCLIENT,
+        IDC_ARROW, LoadCursorW, SetCursor, SetCursorPos, SetWindowLongPtrW, WM_ACTIVATE,
+        WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOVE, WM_SETCURSOR, WM_SIZE, WNDPROC,
     };
 
     static CAPTURED: AtomicBool = AtomicBool::new(false);
     static FIRST_CLICK_SUPPRESS: AtomicBool = AtomicBool::new(false);
     static WINDOW: AtomicUsize = AtomicUsize::new(0);
+    static ORIG_PROC: AtomicUsize = AtomicUsize::new(0);
 
     pub(super) fn register_window(hwnd: HWND) {
         WINDOW.store(hwnd.0 as usize, Ordering::Release);
+    }
+
+    /// Attaches mouse-capture subclassing to the active presentation window (title or fallback).
+    pub(super) fn attach_window(hwnd: HWND) {
+        let raw = hwnd.0 as usize;
+        if raw == 0 {
+            return;
+        }
+        let prev_hwnd = WINDOW.swap(raw, Ordering::AcqRel);
+        if prev_hwnd == raw && ORIG_PROC.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let target = subclass_proc as *const () as isize;
+        // SAFETY: subclassing a window owned by our process; original proc is saved and called.
+        let prev = unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, target) } as usize;
+        if prev != 0 && prev != target as usize {
+            ORIG_PROC.store(prev, Ordering::Release);
+        }
+    }
+
+    extern "system" fn subclass_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match message {
+            WM_LBUTTONDOWN => {
+                if !is_captured() {
+                    set_captured(true);
+                    return LRESULT(0);
+                }
+            }
+            WM_KEYDOWN => {
+                // VK_CAPITAL (Caps Lock) = 0x14
+                if wparam.0 == 0x14 && is_captured() {
+                    set_captured(false);
+                    return LRESULT(0);
+                }
+            }
+            WM_KILLFOCUS => {
+                if is_captured() {
+                    set_captured(false);
+                }
+            }
+            WM_ACTIVATE => {
+                if (wparam.0 & 0xFFFF) == 0 && is_captured() {
+                    set_captured(false);
+                }
+            }
+            WM_MOVE | WM_SIZE => {
+                if is_captured() {
+                    clip_to_window();
+                }
+            }
+            WM_SETCURSOR => {
+                if is_captured() && (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
+                    // SAFETY: hides the cursor while captured inside the client area.
+                    unsafe { SetCursor(None) };
+                    return LRESULT(1);
+                }
+            }
+            _ => {}
+        }
+        let orig = ORIG_PROC.load(Ordering::Acquire);
+        if orig != 0 {
+            // SAFETY: `orig` was returned by `SetWindowLongPtrW(GWLP_WNDPROC)`.
+            let proc: WNDPROC = unsafe { std::mem::transmute(orig) };
+            unsafe { CallWindowProcW(proc, hwnd, message, wparam, lparam) }
+        } else {
+            // SAFETY: fallback default window procedure.
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
     }
 
     pub fn is_captured() -> bool {
