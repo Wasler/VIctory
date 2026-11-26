@@ -2119,7 +2119,7 @@ pub(crate) fn page_writes() -> u8 {
         Ok("slots") => 2,
         Ok("guards") => 1,
         Ok("all") => 15,
-        _ => 1 | 2 | 8,
+        _ => 1,
     })
 }
 
