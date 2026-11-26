@@ -256,7 +256,8 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
 impl Own {
     /// Records the sends into `list`; the copies that `looked` says are in
     /// `COPY_DEST`, the others in the common state. Those with a "before" are
-    /// left readable by compute shaders.
+    /// left readable by compute shaders. Returns the final D3D12 resource state
+    /// of each dirty shadow (`None` means `COMMON`).
     ///
     /// # Safety
     /// An open list of ours, whose compute state is set anew behind this.
@@ -266,11 +267,12 @@ impl Own {
         list: &ID3D12GraphicsCommandList,
         dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)],
         looked: impl Fn(&Shadow) -> bool,
-    ) {
+    ) -> Vec<Option<D3D12_RESOURCE_STATES>> {
         let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         let write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         let dest = D3D12_RESOURCE_STATE_COPY_DEST;
         let (mut first, mut last) = (Vec::new(), Vec::new());
+        let mut states = Vec::with_capacity(dirty.len());
         for ((shadow, _), copy) in dirty.iter().zip(&self.copies) {
             for &(a, from, n) in &copy.runs {
                 // SAFETY: the caller's; live buffers, ranges inside them.
@@ -289,7 +291,9 @@ impl Own {
                 && (!copy.runs.is_empty() || copy.pairs.1 > 0)
             {
                 last.push(transition(&shadow.buffer, was, read));
+                state = Some(read);
             }
+            states.push(state);
         }
         // SAFETY: the caller's; live objects.
         unsafe {
@@ -320,6 +324,7 @@ impl Own {
                 list.ResourceBarrier(&last);
             }
         }
+        states
     }
 
     /// The memory, to be kept until the submission has run.

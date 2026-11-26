@@ -294,40 +294,55 @@ pub(crate) fn land(back: &Back) {
     }
     let (at, end) = back.range();
     let size = end - at;
-    let mut tiled = vec![0u8; size];
-    // Keep title bytes the subresources do not cover.
-    if !crate::host::read_into(at as *const u8, &mut tiled) {
-        return;
+    thread_local! {
+        static TILED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    let mut data = std::ptr::null_mut();
-    // SAFETY: our read-back buffer, written by the list that has run.
-    unsafe {
-        if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+    TILED.with(|cell| {
+        let mut tiled = cell.borrow_mut();
+        if tiled.len() < size {
+            tiled.resize(size, 0);
+        }
+        let tiled = &mut tiled[..size];
+        // Keep title bytes the subresources do not cover.
+        if !crate::host::read_into(at as *const u8, tiled) {
             return;
         }
-    }
-    for (i, (footprint, &rows)) in back.footprints.iter().zip(&back.rows).enumerate() {
-        let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
-        let f = footprint.Footprint;
-        let pitch = f.RowPitch as usize;
-        let len = pitch * rows as usize * f.Depth as usize;
-        // SAFETY: the subresource's part of the mapped buffer.
-        let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
-        if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
-            // SAFETY: mapped above.
-            unsafe { back.buffer.Unmap(0, None) };
-            return;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: our read-back buffer, written by the list that has run.
+        unsafe {
+            if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+                return;
+            }
         }
-    }
-    // SAFETY: mapped above.
-    unsafe { back.buffer.Unmap(0, None) };
-    crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
-    let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
-    if copied == 1 || copied.is_multiple_of(128) {
-        tracing::info!(copied, bytes = size, "texture readback landed");
-    }
+        for (i, (footprint, &rows)) in back.footprints.iter().zip(&back.rows).enumerate() {
+            let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
+            let f = footprint.Footprint;
+            let pitch = f.RowPitch as usize;
+            let len = pitch * rows as usize * f.Depth as usize;
+            // SAFETY: the subresource's part of the mapped buffer.
+            let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
+            if let Err(e) = back.layout.tile(tiled, mip, slice, linear, pitch, pitch * rows as usize) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
+                // SAFETY: mapped above.
+                unsafe { back.buffer.Unmap(0, None) };
+                return;
+            }
+        }
+        // SAFETY: mapped above.
+        unsafe { back.buffer.Unmap(0, None) };
+        crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
+        let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
+        if copied == 1 || copied.is_multiple_of(128) {
+            tracing::info!(
+                copied,
+                bytes = size,
+                buffers_reused = SPARE_STATS[0].load(Ordering::Relaxed),
+                buffers_made = SPARE_STATS[1].load(Ordering::Relaxed),
+                "texture readback landed"
+            );
+        }
+    });
 }
 
 

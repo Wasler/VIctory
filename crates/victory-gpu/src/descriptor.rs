@@ -344,12 +344,17 @@ pub(crate) fn sync_heaps() {
         let began = std::time::Instant::now();
         let taken = written.take(start as usize, end as usize);
         spent[0] += since(began);
-        let mut parts: Vec<(usize, usize)> = Vec::new();
+        // Coalesce contiguous dirty pages into runs up to SYNC_PAGES * PAGE (32 KiB)
+        // so each worker reads a whole run in one safecopy/read_into call and falls
+        // back to 4 KiB pages only if a page inside the run was unmapped.
+        let mut chunks: Vec<(usize, usize)> = Vec::new();
+        let max_chunk = SYNC_PAGES * crate::watch::PAGE;
         for (range_from, range_end) in taken {
-            let mut page = range_from & !(crate::watch::PAGE - 1);
-            while page < range_end {
-                parts.push((page.max(range_from), (page + crate::watch::PAGE).min(range_end)));
-                page += crate::watch::PAGE;
+            let mut at = range_from;
+            while at < range_end {
+                let to = (at + max_chunk).min(range_end);
+                chunks.push((at, to));
+                at = to;
             }
         }
         // A few pages a thread at a time: read, compared with what was last
@@ -358,35 +363,38 @@ pub(crate) fn sync_heaps() {
         let began = std::time::Instant::now();
         let copied = host.copied_begin(step as usize);
         let samplers = heap.samplers();
-        let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(SYNC_PAGES).map(|_| Default::default()).collect();
+        let found: Vec<std::sync::Mutex<SyncPart>> = chunks.iter().map(|_| Default::default()).collect();
         crate::land::each_view(true, found.len(), &|n| {
             let mut out = SyncPart::default();
             let mut page_bytes: Vec<u8> = Vec::new();
             let mut changed: Vec<u32> = Vec::new();
-            for &(from, to) in parts.chunks(SYNC_PAGES).nth(n).unwrap_or_default() {
-                // The page's records are read through the kernel, into a
-                // copy: a page the title unmaps meanwhile fails the read
-                // where 2,048 reads in place would fault.
+            let (chunk_from, chunk_to) = chunks[n];
+            let mut process = |from: usize, to: usize, page_bytes: &mut Vec<u8>| -> bool {
                 page_bytes.resize(to - from, 0);
-                if !crate::host::read_into(from as *const u8, &mut page_bytes) {
-                    continue;
+                if !crate::host::read_into(from as *const u8, page_bytes) {
+                    return false;
                 }
-                out.pages += 1;
-                out.views += u64::from(crate::watch::guarded(from, to));
+                let first_page = from & !(crate::watch::PAGE - 1);
+                let last_page = (to - 1) & !(crate::watch::PAGE - 1);
+                let page_count = ((last_page - first_page) / crate::watch::PAGE + 1) as u64;
+                out.pages += page_count;
+                if crate::watch::guarded(from, to) {
+                    out.views += page_count;
+                }
                 out.bytes += (to - from) as u64;
                 let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                 // A record that straddles the range's ends is left
                 // to the range that holds its first byte.
                 let first = ((from - start as usize) as u64).div_ceil(step).max(slots.start);
                 let Some(records) = page_bytes.get((start + first * step) as usize - from..) else {
-                    continue;
+                    return true;
                 };
                 let count = (records.len() as u64 / step).min(slots.end.saturating_sub(first));
                 out.looked += count;
                 // Only the records that are not the ones last seen
                 // there (`host::Copied::changes`).
                 changed.clear();
-                // SAFETY: the parts are ranges of the heap apart from one
+                // SAFETY: the chunks are ranges of the heap apart from one
                 // another, and only records that lie whole in one are its.
                 unsafe { copied.changes(first as u32, &records[..(count * step) as usize], &mut changed) };
                 for &index in &changed {
@@ -430,6 +438,16 @@ pub(crate) fn sync_heaps() {
                     } else {
                         2
                     }] += 1;
+                }
+                true
+            };
+            if !process(chunk_from, chunk_to, &mut page_bytes) {
+                let mut page = chunk_from & !(crate::watch::PAGE - 1);
+                while page < chunk_to {
+                    let from = page.max(chunk_from);
+                    let to = (page + crate::watch::PAGE).min(chunk_to);
+                    let _ = process(from, to, &mut page_bytes);
+                    page += crate::watch::PAGE;
                 }
             }
             *found[n].lock().unwrap_or_else(|e| e.into_inner()) = out;
