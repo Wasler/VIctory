@@ -703,7 +703,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
 /// many.
 pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
     let bytes: usize = copies.iter().map(|c| c.2).sum();
-    if bytes > 512 << 10 {
+    if bytes > 2 << 20 {
         wide(copy_jobs(copies));
         return;
     }
@@ -1614,7 +1614,7 @@ pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) 
 }
 
 /// About this many bytes to a piece of work for [`wide`].
-const WIDE_JOB: usize = 256 << 10;
+const WIDE_JOB: usize = 1 << 20;
 
 /// With [`wide_back`]: the snapshots noted while a submission is prepared
 /// (from, to, bytes), taken by [`take_snapshots`].
@@ -3934,8 +3934,8 @@ impl Shadow {
     /// they are long: the big heap's copy has some 4 MB of them in each of
     /// 14 refreshes a frame, on one thread while the others had nothing.
     fn take_all(&self, runs: Vec<(usize, usize, bool)>) -> usize {
-        const LONG: usize = 512 << 10;
-        const PART: usize = 128 << 10;
+        const LONG: usize = 1 << 20;
+        const PART: usize = 256 << 10;
         let bytes = runs.iter().map(|r| r.1 - r.0).sum();
         if bytes < LONG || !crate::watch::light() {
             for (from, to, known) in runs {
