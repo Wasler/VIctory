@@ -3863,35 +3863,9 @@ pub(crate) fn walls_trace() -> bool {
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
     // Textures shaders wrote that the title reads on the CPU
-    // ([`crate::texback`]). When multiple non-overlapping readbacks land in
-    // one list, tile them in parallel on the landing pool to cut the relay's
-    // READ_BACKS stall (up to 13+ ms/frame in dense open-world traffic).
-    let tex_backs = &list.deferred().texture_backs;
-    if tex_backs.len() >= 2 && crate::land::on() {
-        let mut disjoint = true;
-        'check: for i in 0..tex_backs.len() {
-            let (a0, a1) = tex_backs[i].range();
-            for j in i + 1..tex_backs.len() {
-                let (b0, b1) = tex_backs[j].range();
-                if a0 < b1 && b0 < a1 {
-                    disjoint = false;
-                    break 'check;
-                }
-            }
-        }
-        if disjoint {
-            crate::land::each(tex_backs.len(), &|i| {
-                crate::texback::land(&tex_backs[i]);
-            });
-        } else {
-            for back in tex_backs {
-                crate::texback::land(back);
-            }
-        }
-    } else {
-        for back in tex_backs {
-            crate::texback::land(back);
-        }
+    // ([`crate::texback`]).
+    for back in &list.deferred().texture_backs {
+        crate::texback::land(back);
     }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();

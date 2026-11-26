@@ -23,70 +23,23 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 const SLOTS: u32 = 16;
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), DescriptorTable(SRV(t0, numDescriptors=2), UAV(u0)), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
+#define RS "RootConstants(num32BitConstants=5, b0), DescriptorTable(SRV(t0, numDescriptors=2), UAV(u0)), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
 cbuffer Size : register(b0) {
     uint w;
     uint h;
     uint premultiplied;
     float sharpen;
     uint ui_downscale;
-    uint aa_on;
 };
 Texture2D<float4> game : register(t0);
 Texture2D<float4> ui : register(t1);
 RWTexture2D<float4> outp : register(u0);
 SamplerState linear_clamp : register(s0);
 
-static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
-
-// Fast console-style FXAA-lite: removes stair-stepping / jaggies on geometric
-// edges from non-TAA upscaling while leaving flat textures untouched.
-float3 fxaa_lite(float2 uv, float2 invDim, float3 cc, float lc) {
-    float3 nw = game.SampleLevel(linear_clamp, uv + float2(-invDim.x, -invDim.y), 0).rgb;
-    float3 ne = game.SampleLevel(linear_clamp, uv + float2( invDim.x, -invDim.y), 0).rgb;
-    float3 sw = game.SampleLevel(linear_clamp, uv + float2(-invDim.x,  invDim.y), 0).rgb;
-    float3 se = game.SampleLevel(linear_clamp, uv + float2( invDim.x,  invDim.y), 0).rgb;
-
-    float lNW = dot(nw, LUMA);
-    float lNE = dot(ne, LUMA);
-    float lSW = dot(sw, LUMA);
-    float lSE = dot(se, LUMA);
-
-    float lMin = min(lc, min(min(lNW, lNE), min(lSW, lSE)));
-    float lMax = max(lc, max(max(lNW, lNE), max(lSW, lSE)));
-    float lRange = lMax - lMin;
-    if (lRange < max(0.0625, lMax * 0.125)) {
-        return cc;
-    }
-
-    float2 dir;
-    dir.x = -((lNW + lNE) - (lSW + lSE));
-    dir.y =  ((lNW + lSW) - (lNE + lSE));
-    float dirReduce = max((lNW + lNE + lSW + lSE) * 0.03125, 1.0 / 128.0);
-    float rcpDirMin = rcp(min(abs(dir.x), abs(dir.y)) + dirReduce);
-    dir = clamp(dir * rcpDirMin, float2(-4.0, -4.0), float2(4.0, 4.0)) * invDim;
-
-    float3 rgbA = 0.5 * (
-        game.SampleLevel(linear_clamp, uv + dir * (1.0 / 3.0 - 0.5), 0).rgb +
-        game.SampleLevel(linear_clamp, uv + dir * (2.0 / 3.0 - 0.5), 0).rgb
-    );
-    float3 rgbB = rgbA * 0.5 + 0.25 * (
-        game.SampleLevel(linear_clamp, uv + dir * -0.5, 0).rgb +
-        game.SampleLevel(linear_clamp, uv + dir *  0.5, 0).rgb
-    );
-    float lB = dot(rgbB, LUMA);
-    return (lB < lMin || lB > lMax) ? rgbA : rgbB;
-}
-
 // AMD FidelityFX RCAS (Robust Contrast-Adaptive Sharpening): restores crisp
 // detail from 720p->1080p upscaling without white halos or ringing on edges.
-float3 rcas(int2 p, int2 dim, float2 uv, float2 invDim, float strength, uint do_aa) {
+float3 rcas(int2 p, int2 dim, float strength) {
     float3 cc = game.Load(int3(p, 0)).rgb;
-    float lc = dot(cc, LUMA);
-    if (do_aa != 0) {
-        cc = fxaa_lite(uv, invDim, cc, lc);
-        lc = dot(cc, LUMA);
-    }
     if (strength <= 0.001) return cc;
 
     float3 cn = game.Load(int3(p.x, max(p.y - 1, 0), 0)).rgb;
@@ -94,10 +47,12 @@ float3 rcas(int2 p, int2 dim, float2 uv, float2 invDim, float strength, uint do_
     float3 cw = game.Load(int3(max(p.x - 1, 0), p.y, 0)).rgb;
     float3 ce = game.Load(int3(min(p.x + 1, dim.x - 1), p.y, 0)).rgb;
 
-    float ln = dot(cn, LUMA);
-    float ls = dot(cs, LUMA);
-    float lw = dot(cw, LUMA);
-    float le = dot(ce, LUMA);
+    const float3 luma = float3(0.2126, 0.7152, 0.0722);
+    float lc = dot(cc, luma);
+    float ln = dot(cn, luma);
+    float ls = dot(cs, luma);
+    float lw = dot(cw, luma);
+    float le = dot(ce, luma);
 
     float mn = min(lc, min(min(ln, ls), min(lw, le)));
     float mx = max(lc, max(max(ln, ls), max(lw, le)));
@@ -118,7 +73,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= w || id.y >= h) return;
     float2 invDim = rcp(float2(w, h));
     float2 uv = (float2(id.xy) + 0.5) * invDim;
-    float3 g = rcas(int2(id.xy), int2(w, h), uv, invDim, sharpen, aa_on);
+    float3 g = rcas(int2(id.xy), int2(w, h), sharpen);
     float4 u;
     if (ui_downscale != 0) {
         // 4-tap 2x2 box filter for crisp 4K UI -> 1080p downscaling.
@@ -218,21 +173,15 @@ fn premultiplied() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PLANE_PREMULTIPLIED").is_some_and(|v| v == "1"))
 }
 
-/// RCAS sharpening strength in `[0.0, 1.0]` (`VICTORY_COMPOSE_SHARPEN`, default `0.55`; `0` disables).
+/// RCAS sharpening strength in `[0.0, 1.0]` (`VICTORY_COMPOSE_SHARPEN`, default `0.70`; `0` disables).
 fn sharpen() -> f32 {
     static VAL: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *VAL.get_or_init(|| {
         std::env::var("VICTORY_COMPOSE_SHARPEN")
             .ok()
             .and_then(|v| v.trim().parse::<f32>().ok())
-            .map_or(0.55, |v| v.clamp(0.0, 1.0))
+            .map_or(0.70, |v| v.clamp(0.0, 1.0))
     })
-}
-
-/// FXAA-lite edge anti-aliasing before RCAS (`VICTORY_COMPOSE_AA`, on by default; `0` disables).
-fn aa_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_COMPOSE_AA").is_none_or(|v| v != "0"))
 }
 
 /// Records, into the present's `list`, `ui` laid over `game` into a
@@ -337,14 +286,7 @@ pub(crate) fn record(
         after.push(t(ui, read, ui_state));
     }
     let ui_downscale = u32::from(ud.Width > w || ud.Height > h);
-    let constants: [u32; 6] = [
-        w as u32,
-        h,
-        u32::from(premultiplied()),
-        sharpen().to_bits(),
-        ui_downscale,
-        u32::from(aa_on()),
-    ];
+    let constants: [u32; 5] = [w as u32, h, u32::from(premultiplied()), sharpen().to_bits(), ui_downscale];
     // SAFETY: an open list (the present's); slots of our heap; live
     // resources and objects (the pass's own live as long as the process,
     // the texture is kept by the present's list).
@@ -356,7 +298,7 @@ pub(crate) fn record(
         list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
         list.SetComputeRootSignature(&pass.root);
         list.SetPipelineState(&pass.pso);
-        list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        list.SetComputeRoot32BitConstants(0, 5, constants.as_ptr().cast(), 0);
         list.SetComputeRootDescriptorTable(1, gpu);
         list.Dispatch((w as u32).div_ceil(8), h.div_ceil(8), 1);
         list.ResourceBarrier(&after);
@@ -398,8 +340,5 @@ mod tests {
             panic!("compose HLSL failed to compile ({e}): {msg}");
         }
         assert!(code.is_some());
-        if let Some(host) = crate::host::host() {
-            make(&host.device).expect("compose::make failed on host D3D12 device");
-        }
     }
 }
