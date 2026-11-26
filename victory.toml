@@ -1,0 +1,15 @@
+# Local VIctory configuration (git-ignored).
+# Every path must stay OUTSIDE the repository.
+
+[paths]
+# Grand Theft Auto VI (Xbox Series X|S) dump
+game_dir = 'D:\torint\GTA6.Xbox.v1.0.2.1-CYBERLEEK'
+
+# Derived data (shader cache, converted assets)
+cache_dir = 'D:\victory-data\cache'
+
+# Persistent local storage (saves, settings, crashes.log)
+data_dir = 'D:\victory-data\data'
+
+# Other Xbox Series titles used to test platform-level code
+test_titles = []
