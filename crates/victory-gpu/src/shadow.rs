@@ -703,7 +703,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
 /// many.
 pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
     let bytes: usize = copies.iter().map(|c| c.2).sum();
-    if bytes > 4 << 20 {
+    if bytes > 512 << 10 {
         wide(copy_jobs(copies));
         return;
     }
@@ -1614,7 +1614,7 @@ pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) 
 }
 
 /// About this many bytes to a piece of work for [`wide`].
-const WIDE_JOB: usize = 1 << 20;
+const WIDE_JOB: usize = 256 << 10;
 
 /// With [`wide_back`]: the snapshots noted while a submission is prepared
 /// (from, to, bytes), taken by [`take_snapshots`].
@@ -3598,20 +3598,29 @@ impl Shadow {
             }
             *runs_left = left.into_inner().max(0) as usize;
             let mut taken = Vec::new();
+            let mut all_runs: Vec<(usize, usize)> = Vec::new();
+            let (mut total_runs, mut total_bytes) = (0u64, 0u64);
             for (i, runs) in done.into_iter().enumerate() {
                 let Some(runs) = runs.into_inner().unwrap_or_else(|e| e.into_inner()) else {
                     continue;
                 };
                 let (lo, hi) = ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e));
-                MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
-                MERGED[2].fetch_add(runs.iter().map(|r| r.1 as u64).sum(), Ordering::Relaxed);
-                self.card_changed_runs(runs.into_iter().map(|(r, m)| (lo - start + r, lo - start + r + m)));
+                total_runs += runs.len() as u64;
+                for (r, m) in runs {
+                    total_bytes += m as u64;
+                    all_runs.push((lo - start + r, lo - start + r + m));
+                }
                 // Taken, if the range holds all of the page that is in the
                 // copy; else the rest of it is the refresh's, which notes
                 // only whole pages, and the page is looked at again.
                 if lo < hi && (stale[i] * PAGE).max(start) >= a && ((stale[i] + 1) * PAGE).min(end) <= e {
                     taken.push(stale[i]);
                 }
+            }
+            if total_runs > 0 {
+                MERGED[1].fetch_add(total_runs, Ordering::Relaxed);
+                MERGED[2].fetch_add(total_bytes, Ordering::Relaxed);
+                self.card_changed_runs(all_runs.into_iter());
             }
             drop(before);
             drop(merging);
@@ -3925,8 +3934,8 @@ impl Shadow {
     /// they are long: the big heap's copy has some 4 MB of them in each of
     /// 14 refreshes a frame, on one thread while the others had nothing.
     fn take_all(&self, runs: Vec<(usize, usize, bool)>) -> usize {
-        const LONG: usize = 1 << 20;
-        const PART: usize = 256 << 10;
+        const LONG: usize = 512 << 10;
+        const PART: usize = 128 << 10;
         let bytes = runs.iter().map(|r| r.1 - r.0).sum();
         if bytes < LONG || !crate::watch::light() {
             for (from, to, known) in runs {

@@ -235,6 +235,7 @@ pub(crate) fn make_way() -> bool {
 }
 
 fn worker() {
+    crate::cores::keep_on_efficiency_cores("victory-heap");
     let Some(job) = JOB.get() else {
         return;
     };

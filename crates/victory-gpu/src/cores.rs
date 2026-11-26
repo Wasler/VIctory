@@ -38,6 +38,13 @@ fn fast_of(sets: &[(u32, u8)]) -> Vec<u32> {
     if fast.len() == sets.len() { Vec::new() } else { fast }
 }
 
+/// The sets of the slower (efficiency) class, if the processor is hybrid.
+fn slow_of(sets: &[(u32, u8)]) -> Vec<u32> {
+    let best = sets.iter().map(|c| c.1).max().unwrap_or(0);
+    let slow: Vec<u32> = sets.iter().filter(|c| c.1 < best).map(|c| c.0).collect();
+    if slow.len() == sets.len() { Vec::new() } else { slow }
+}
+
 /// `VICTORY_FAST_CORES`: 0: no thread asks; 1: the threads a frame waits for
 /// one by one; 2 (the default): the threads they share their work with too;
 /// 3: those that work beside the rest as well (lists translated, descriptors
@@ -67,6 +74,31 @@ pub(crate) fn keep_helper_on_fast_cores(what: &str) {
 /// a frame waits for.
 pub(crate) fn keep_many_on_fast_cores(what: &str) {
     ask(what, 3);
+}
+
+/// Keeps background streaming work (e.g. `victory-heap`) on efficiency cores on
+/// hybrid CPUs (such as 6P+8E), leaving P-cores and their L2 cache free for the
+/// critical-path `submit` and `relay` threads.
+pub(crate) fn keep_on_efficiency_cores(what: &str) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
+    if stage() == 0 {
+        return;
+    }
+    static SLOW: std::sync::OnceLock<(Vec<u32>, usize)> = std::sync::OnceLock::new();
+    let (slow, of) = SLOW.get_or_init(|| {
+        let sets = cpu_sets();
+        (slow_of(&sets), sets.len())
+    });
+    if slow.is_empty() {
+        return;
+    }
+    // SAFETY: our own thread and a list of the system's own set ids.
+    let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), slow.as_ptr(), slow.len() as u32) };
+    if ok == 0 {
+        tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread could not be kept on the efficiency cores");
+    } else {
+        tracing::info!(what, slow = slow.len(), of, "the thread is kept on the efficiency cores (VICTORY_FAST_CORES=0: not)");
+    }
 }
 
 fn ask(what: &str, from: u32) {
@@ -101,7 +133,11 @@ mod tests {
         assert_eq!(fast_of(&[(256, 1), (257, 1), (258, 0)]), [256, 257]);
         assert!(fast_of(&[(256, 0), (257, 0)]).is_empty());
         assert!(fast_of(&[]).is_empty());
+        assert_eq!(slow_of(&[(256, 1), (257, 1), (258, 0)]), [258]);
+        assert!(slow_of(&[(256, 0), (257, 0)]).is_empty());
+        assert!(slow_of(&[]).is_empty());
         assert!(!cpu_sets().is_empty());
         std::thread::spawn(|| keep_on_fast_cores("test")).join().unwrap();
+        std::thread::spawn(|| keep_on_efficiency_cores("test-e")).join().unwrap();
     }
 }

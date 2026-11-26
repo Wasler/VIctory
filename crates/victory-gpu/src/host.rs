@@ -2559,6 +2559,7 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
 /// 64 KiB piece; the compare hashes the whole piece for each and stores
 /// the hash, so the second of them may find it stored already and not
 /// flag it.
+#[cfg(test)]
 fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
     let mut pieces: Vec<(usize, u32)> = flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect();
     pieces.sort_unstable();
