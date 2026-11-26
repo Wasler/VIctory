@@ -877,7 +877,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         if host.copied_tabled(index, frame) {
             return None;
         }
-        let view = host.mirror(index, heap.handle(index)?, true)?;
+        let view = host.mirror_unmarked(index, heap.handle(index)?)?;
         // The copy the slot shows (`buffer_copy`), not the one the
         // view's range alone would find.
         let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;

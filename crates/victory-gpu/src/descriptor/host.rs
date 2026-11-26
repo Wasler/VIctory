@@ -2466,6 +2466,10 @@ impl HostHeap {
     /// caller's to make null when it has let go of its own slot's lock
     /// ([`HostHeap::unmake_stale`]).
     fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<(u32, u64)> {
+        self.note_buffer_marking(index, view, seen, true)
+    }
+
+    fn note_buffer_marking(&self, index: u32, view: Option<&View>, seen: bool, mark: bool) -> Vec<(u32, u64)> {
         if self.sampler {
             return Vec::new();
         }
@@ -2556,7 +2560,7 @@ impl HostHeap {
         } else {
             self.buffers.remove(index)
         };
-        if was {
+        if was && mark {
             self.changed.put(index);
         }
         stale
@@ -3007,6 +3011,16 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_marking(index, handle, for_draw, true)
+    }
+
+    /// As [`Self::mirror`] for a draw, for the heap buffer pass itself: the slot is not marked
+    /// for the next pass (after fxceless/victory-fork#1043 / flamingo d56f7b04).
+    pub(crate) fn mirror_unmarked(&self, index: u32, handle: u64) -> Option<View> {
+        self.mirror_marking(index, handle, true, false)
+    }
+
+    fn mirror_marking(&self, index: u32, handle: u64, for_draw: bool, mark: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -3058,7 +3072,7 @@ impl HostHeap {
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
             // (When this slot's lock is let go: a lock at a time.)
-            let stale = self.note_buffer(index, Some(&view), for_draw);
+            let stale = self.note_buffer_marking(index, Some(&view), for_draw, mark);
             // A view of a texture object that has no host copy yet waits
             // for it, as buffer views wait for a draw: the slot is made
             // when the texture is first used (`super::make_waiting`), or

@@ -2117,8 +2117,9 @@ pub(crate) fn page_writes() -> u8 {
         Ok("0") => 0,
         Ok("1") => 3,
         Ok("slots") => 2,
-        Ok("all") => 7,
-        _ => 1,
+        Ok("guards") => 1,
+        Ok("all") => 15,
+        _ => 1 | 2 | 8,
     })
 }
 
@@ -2155,7 +2156,11 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
         WRITTEN[1].fetch_add(len as u64, Relaxed);
     } else {
         WRITTEN[3].fetch_add(1, Relaxed);
+        if mode & (4 | 8) == 0 {
+            return;
+        }
         if mode & 4 == 0 {
+            crate::descriptor::host::page_written(at, len);
             return;
         }
     }
