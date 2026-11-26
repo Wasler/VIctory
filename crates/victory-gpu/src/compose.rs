@@ -398,5 +398,8 @@ mod tests {
             panic!("compose HLSL failed to compile ({e}): {msg}");
         }
         assert!(code.is_some());
+        if let Some(host) = crate::host::host() {
+            make(&host.device).expect("compose::make failed on host D3D12 device");
+        }
     }
 }
